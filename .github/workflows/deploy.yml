@@ -1,0 +1,296 @@
+# -----------------------------------------------------------------------------
+# Microservice Deploy — Docker build -> AWS ECR -> EC2 (via SSM)
+# -----------------------------------------------------------------------------
+# Trigger: push to master (or run manually from the Actions tab; master only).
+#
+# Flow:
+#   1. Build this repository's Docker image.
+#   2. Make sure the ECR repository exists and keeps only the latest 5 images.
+#   3. Push the image to ECR (tags: <commit sha> and latest).
+#   4. Over SSM, on the EC2 instance: pull the new image and recreate ONLY
+#      this service with the existing docker-compose.yml + override.
+#      Other services keep running untouched (--no-deps).
+#
+# Per-repository values: SERVICE_NAME, ECR_REPOSITORY, DOCKERFILE_PATH,
+# BUILD_CONTEXT, STABLE_SECONDS.
+#
+# Repository variables (Settings -> Secrets and variables -> Actions -> Variables):
+#   AWS_DEPLOY_ROLE_ARN  IAM role for GitHub OIDC login (required)
+#   EC2_INSTANCE_ID      instance to deploy to (required)
+#   AWS_REGION           AWS region (optional, default us-east-1)
+# -----------------------------------------------------------------------------
+
+name: Deploy to EC2
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC login to AWS
+  contents: read
+
+# Never run two deployments of the same service at once.
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+  DEPLOYMENT_DIR: /home/ec2-user/weave-socks
+
+  # --- per-repository values ---
+  SERVICE_NAME: user                            # service name in docker-compose.yml
+  ECR_REPOSITORY: weave-socks/user              # must match the image in docker-compose.override.yml
+  DOCKERFILE_PATH: docker/user/Dockerfile-binary
+  BUILD_CONTEXT: build                         # binary built by the test step
+  STABLE_SECONDS: 30
+
+jobs:
+
+  build-and-push:
+    name: Build and Push to ECR
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master'
+    timeout-minutes: 30
+
+    steps:
+      # Fail early (before any build or push) if the target is not configured.
+      - name: Check deploy settings
+        run: |
+          if [ -z "$EC2_INSTANCE_ID" ]; then
+            echo "::error::Set the repository variable EC2_INSTANCE_ID (Settings -> Secrets and variables -> Actions -> Variables)."
+            exit 1
+          fi
+          echo "Deploying to $EC2_INSTANCE_ID in $AWS_REGION"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Test and compile once (Go 1.7, glide). The db tests start their own
+      # MongoDB, so this runs in mongo:3 (as Dockerfile-test does). Downloads
+      # are retried; the image then only packages build/user. A failure stops
+      # the job before anything is pushed.
+      - name: Unit tests and build binary
+        run: |
+          mkdir -p build
+          git archive HEAD | docker run --rm -i -v "$PWD/build":/out mongo:3 sh -c '
+            mkdir -p /tmp/src && tar -x -C /tmp/src &&
+            apt-get update -qq && apt-get install -yqq git curl >/dev/null &&
+            curl -sSL --retry 5 --retry-delay 5 https://go.dev/dl/go1.7.linux-amd64.tar.gz -o /tmp/go.tgz &&
+            tar -C /usr/local -xzf /tmp/go.tgz &&
+            export GOPATH=/go PATH=/go/bin:/usr/local/go/bin:$PATH &&
+            P=/go/src/github.com/microservices-demo/user && mkdir -p $P && cp -r /tmp/src/. $P && cd $P &&
+            go get github.com/Masterminds/glide &&
+            for n in 1 2 3; do glide install && break; echo "glide install attempt $n failed"; [ $n = 3 ] && exit 1; sleep 10; done &&
+            glide novendor | xargs go test &&
+            CGO_ENABLED=0 go build -a -installsuffix cgo -o /out/user main.go'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+
+      - name: Ensure ECR repository and lifecycle policy
+        run: |
+          # Create the repository only if AWS says it does not exist; any
+          # other error (permissions, throttling) fails with the real message.
+          if ! OUT=$(aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" 2>&1); then
+            if echo "$OUT" | grep -q "RepositoryNotFoundException"; then
+              echo "Creating ECR repository $ECR_REPOSITORY"
+              aws ecr create-repository --repository-name "$ECR_REPOSITORY" >/dev/null
+            else
+              echo "::error::Could not check ECR repository $ECR_REPOSITORY"
+              echo "$OUT"
+              exit 1
+            fi
+          fi
+
+          # Keep only the newest 5 images. An image tagged both <sha> and
+          # latest counts once.
+          aws ecr put-lifecycle-policy \
+            --repository-name "$ECR_REPOSITORY" \
+            --lifecycle-policy-text '{
+              "rules": [{
+                "rulePriority": 1,
+                "description": "Keep only the latest 5 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": { "type": "expire" }
+              }]
+            }' >/dev/null
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # The EC2 instance is x86 (t3a), so build linux/amd64.
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.BUILD_CONTEXT }}
+          file: ${{ env.DOCKERFILE_PATH }}
+          push: true
+          platforms: linux/amd64
+          provenance: false   # keep one image per push so the 5-image limit is accurate
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/master'
+    timeout-minutes: 20
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+
+      # Registry host for this account/region (not hardcoded).
+      - name: Get ECR registry
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Send deploy command via SSM
+        id: ssm
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          # Script that runs on the EC2 instance (as root, via SSM).
+          cat > deploy.sh <<EOF
+          set -euo pipefail
+          cd "${DEPLOYMENT_DIR}"
+
+          if docker compose version >/dev/null 2>&1; then
+            COMPOSE="docker compose"
+          else
+            COMPOSE="docker-compose"
+          fi
+
+          aws ecr get-login-password --region "${AWS_REGION}" \
+            | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+          # The compose files must point this service at the ECR image,
+          # otherwise pull/up would silently redeploy the old image.
+          CONFIGURED=\$(\$COMPOSE config | awk '
+            \$0 == "  ${SERVICE_NAME}:" { in_svc = 1; next }
+            in_svc && /^  [^ ]/        { in_svc = 0 }
+            in_svc && /^    image:/    { print \$2 }')
+          echo "Image configured for ${SERVICE_NAME}: \$CONFIGURED"
+          if [ "\$CONFIGURED" != "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest" ]; then
+            echo "ERROR: ${SERVICE_NAME} is not configured to use ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
+            echo "Add it as the image in docker-compose.override.yml on the server."
+            exit 1
+          fi
+
+          # Pull and recreate ONLY this service; --no-deps leaves others alone.
+          \$COMPOSE pull "${SERVICE_NAME}"
+          \$COMPOSE up -d --no-deps "${SERVICE_NAME}"
+
+          # Fail the deploy unless the new container stays running (and does
+          # not restart) for STABLE_SECONDS. Catches crash-on-start and loops.
+          CID=\$(\$COMPOSE ps -q "${SERVICE_NAME}")
+          if [ -z "\$CID" ]; then
+            echo "ERROR: no container found for ${SERVICE_NAME}"
+            exit 1
+          fi
+          RESTARTS=\$(docker inspect -f '{{.RestartCount}}' "\$CID")
+          for i in \$(seq 1 ${STABLE_SECONDS}); do
+            sleep 1
+            RUNNING=\$(docker inspect -f '{{.State.Running}}' "\$CID")
+            NOW=\$(docker inspect -f '{{.RestartCount}}' "\$CID")
+            if [ "\$RUNNING" != "true" ] || [ "\$NOW" != "\$RESTARTS" ]; then
+              echo "ERROR: ${SERVICE_NAME} stopped or restarted after deploy"
+              \$COMPOSE ps "${SERVICE_NAME}"
+              \$COMPOSE logs --tail 50 "${SERVICE_NAME}"
+              exit 1
+            fi
+          done
+          echo "${SERVICE_NAME} stayed running for ${STABLE_SECONDS}s"
+
+          \$COMPOSE ps "${SERVICE_NAME}"
+          EOF
+
+          # Build the SSM parameters as JSON (avoids shell-quoting problems).
+          jq -n --rawfile script deploy.sh \
+            '{commands: ($script | split("\n")), workingDirectory: ["/"], executionTimeout: ["900"]}' \
+            > params.json
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy ${SERVICE_NAME} ${GITHUB_SHA::7}" \
+            --parameters file://params.json \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM command: $COMMAND_ID"
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for deployment
+        run: |
+          COMMAND_ID="${{ steps.ssm.outputs.command_id }}"
+
+          # Poll for up to 15 minutes. Right after send-command AWS may not have
+          # registered the invocation yet (InvocationDoesNotExist): keep waiting.
+          # Any other AWS error (permissions, credentials, wrong instance) fails
+          # at once with the real message instead of looping as "Pending".
+          STATUS="Pending"
+          for i in $(seq 1 90); do
+            if OUT=$(aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$EC2_INSTANCE_ID" \
+                --query "Status" --output text 2>&1); then
+              STATUS="$OUT"
+            elif echo "$OUT" | grep -q "InvocationDoesNotExist"; then
+              STATUS="Pending"
+            else
+              echo "::error::Could not read the deployment status from AWS SSM"
+              echo "$OUT"
+              exit 1
+            fi
+            echo "Status: $STATUS"
+            # "Cancelling" is not final; keep polling until it becomes "Cancelled".
+            case "$STATUS" in
+              Success|Failed|TimedOut|Cancelled) break ;;
+            esac
+            sleep 10
+          done
+
+          echo "----- output from EC2 -----"
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$EC2_INSTANCE_ID" \
+            --query "[StandardOutputContent, StandardErrorContent]" \
+            --output text || true
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "::error::Deployment finished with status: $STATUS"
+            exit 1
+          fi
+          echo "Deployment succeeded"
+
+      # If the job fails, times out or is cancelled while the command is still
+      # running on EC2, stop it there, so a later deploy can't race with it.
+      - name: Cancel SSM command if the deploy did not finish
+        if: (cancelled() || failure()) && steps.ssm.outputs.command_id != ''
+        run: |
+          echo "Cancelling SSM command ${{ steps.ssm.outputs.command_id }}"
+          aws ssm cancel-command --command-id "${{ steps.ssm.outputs.command_id }}" || true
