@@ -14,8 +14,10 @@
 # Per-repository values: SERVICE_NAME, ECR_REPOSITORY, DOCKERFILE_PATH,
 # BUILD_CONTEXT, STABLE_SECONDS.
 #
-# AWS credentials: GitHub OIDC only. Set the repository variable
-# AWS_DEPLOY_ROLE_ARN (Settings -> Secrets and variables -> Actions -> Variables).
+# Repository variables (Settings -> Secrets and variables -> Actions -> Variables):
+#   AWS_DEPLOY_ROLE_ARN  IAM role for GitHub OIDC login (required)
+#   EC2_INSTANCE_ID      instance to deploy to (required)
+#   AWS_REGION           AWS region (optional, default us-east-1)
 # -----------------------------------------------------------------------------
 
 name: Deploy to EC2
@@ -36,15 +38,15 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  AWS_REGION: us-east-1
-  EC2_INSTANCE_ID: i-0d749035d946d750a
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
   DEPLOYMENT_DIR: /home/ec2-user/weave-socks
 
   # --- per-repository values ---
   SERVICE_NAME: user                            # service name in docker-compose.yml
   ECR_REPOSITORY: weave-socks/user              # must match the image in docker-compose.override.yml
-  DOCKERFILE_PATH: docker/user/Dockerfile-release
-  BUILD_CONTEXT: .
+  DOCKERFILE_PATH: docker/user/Dockerfile-binary
+  BUILD_CONTEXT: build                         # binary built by the test step
   STABLE_SECONDS: 30
 
 jobs:
@@ -56,22 +58,36 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      # Fail early (before any build or push) if the target is not configured.
+      - name: Check deploy settings
+        run: |
+          if [ -z "$EC2_INSTANCE_ID" ]; then
+            echo "::error::Set the repository variable EC2_INSTANCE_ID (Settings -> Secrets and variables -> Actions -> Variables)."
+            exit 1
+          fi
+          echo "Deploying to $EC2_INSTANCE_ID in $AWS_REGION"
+
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Unit tests on Go 1.7 (glide). The db tests start their own MongoDB, so
-      # they run in mongo:3 (as Dockerfile-test does, whose Go download URL no
-      # longer works). A failure stops the job before anything is pushed.
-      - name: Unit tests
+      # Test and compile once (Go 1.7, glide). The db tests start their own
+      # MongoDB, so this runs in mongo:3 (as Dockerfile-test does). Downloads
+      # are retried; the image then only packages build/user. A failure stops
+      # the job before anything is pushed.
+      - name: Unit tests and build binary
         run: |
-          git archive HEAD | docker run --rm -i mongo:3 sh -c '
+          mkdir -p build
+          git archive HEAD | docker run --rm -i -v "$PWD/build":/out mongo:3 sh -c '
             mkdir -p /tmp/src && tar -x -C /tmp/src &&
             apt-get update -qq && apt-get install -yqq git curl >/dev/null &&
-            curl -sSL https://go.dev/dl/go1.7.linux-amd64.tar.gz | tar -C /usr/local -xz &&
+            curl -sSL --retry 5 --retry-delay 5 https://go.dev/dl/go1.7.linux-amd64.tar.gz -o /tmp/go.tgz &&
+            tar -C /usr/local -xzf /tmp/go.tgz &&
             export GOPATH=/go PATH=/go/bin:/usr/local/go/bin:$PATH &&
             P=/go/src/github.com/microservices-demo/user && mkdir -p $P && cp -r /tmp/src/. $P && cd $P &&
-            go get github.com/Masterminds/glide && glide install &&
-            glide novendor | xargs go test'
+            go get github.com/Masterminds/glide &&
+            for n in 1 2 3; do glide install && break; echo "glide install attempt $n failed"; [ $n = 3 ] && exit 1; sleep 10; done &&
+            glide novendor | xargs go test &&
+            CGO_ENABLED=0 go build -a -installsuffix cgo -o /out/user main.go'
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
